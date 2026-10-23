@@ -1,0 +1,372 @@
+name: MT3000 ImmortalWrt
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev zlib1g-dev gawk gettext unzip file wget curl rsync python3 zstd libssl-dev
+      - name: Restore build configuration
+        shell: bash
+        run: |
+          mkdir -p build-kit
+          cat > 'build-kit/.gitattributes' <<'MT3000_FILE_EOF'
+          * text=auto eol=lf
+          *.bin binary
+          MT3000_FILE_EOF
+          cat > 'build-kit/.gitignore' <<'MT3000_FILE_EOF'
+          work/
+          firmware/
+          MT3000_FILE_EOF
+          cat > 'build-kit/build.sh' <<'MT3000_FILE_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          VERSION=25.12.2
+          PROFILE=glinet_gl-mt3000
+          ARCHIVE="immortalwrt-imagebuilder-${VERSION}-mediatek-filogic.Linux-x86_64.tar.zst"
+          BASE="https://downloads.immortalwrt.org/releases/${VERSION}/targets/mediatek/filogic"
+          EXPECTED=e6af4f8c5db66e52c4bd5e2b629f8a617d61c6ebc94dc8c52754fa143cb4ac9a
+          [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { echo 'Use x86_64 Linux.' >&2; exit 1; }
+          mkdir -p "$ROOT/work" "$ROOT/firmware"
+          cd "$ROOT/work"
+          curl --fail --location --retry 5 --output "$ARCHIVE" "$BASE/$ARCHIVE"
+          printf '%s  %s\n' "$EXPECTED" "$ARCHIVE" | sha256sum -c -
+          tar --zstd -xf "$ARCHIVE"
+          cd "${ARCHIVE%.tar.zst}"
+          curl --fail --location --retry 5 --output verified-profiles.json "$BASE/profiles.json"
+          python3 - "$PROFILE" <<'PY'
+          import json,sys
+          assert sys.argv[1] in json.load(open('verified-profiles.json'))['profiles'], 'Device profile unavailable'
+          PY
+          chmod +x "$ROOT/files/etc/uci-defaults/99-mt3000" "$ROOT/files/etc/hotplug.d/net/90-phone" "$ROOT/files/etc/init.d/phone-detect" "$ROOT/files/usr/sbin/phone-detect"
+          PACKAGES="$(sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$ROOT/packages.txt" | tr '\n' ' ')"
+          make image PROFILE="$PROFILE" PACKAGES="$PACKAGES" FILES="$ROOT/files" -j"$(nproc)" 2>&1 | tee "$ROOT/firmware/build.log"
+          find bin/targets/mediatek/filogic -maxdepth 1 -type f -name '*gl-mt3000*' -exec cp -t "$ROOT/firmware" {} +
+          test -s "$ROOT/firmware/immortalwrt-${VERSION}-mediatek-filogic-${PROFILE}-squashfs-sysupgrade.bin"
+          manifest=$(find "$ROOT/firmware" -name '*.manifest' -print -quit)
+          test -n "$manifest"
+          for pkg in luci-theme-argon kmod-usb-net-rndis kmod-usb-net-cdc-ncm kmod-usb-net-ipheth usbmuxd; do
+              grep -q "^${pkg} " "$manifest" || { echo "Missing package: $pkg" >&2; exit 1; }
+          done
+          cp "$ROOT/packages.txt" "$ROOT/firmware/requested-packages.txt"
+          cd "$ROOT/firmware"
+          sha256sum ./*.bin > SHA256SUMS
+          MT3000_FILE_EOF
+          cat > 'build-kit/packages.txt' <<'MT3000_FILE_EOF'
+          # Preserve the device defaults, including wireless drivers and wpad.
+          luci-ssl
+          luci-i18n-base-zh-cn
+          luci-i18n-firewall-zh-cn
+          luci-theme-argon
+          luci-app-argon-config
+          luci-i18n-argon-config-zh-cn
+          luci-app-firewall
+          kmod-usb3
+          kmod-usb-net-rndis
+          kmod-usb-net-cdc-ether
+          kmod-usb-net-cdc-ncm
+          kmod-usb-net-cdc-eem
+          kmod-usb-net-ipheth
+          usbmuxd
+          libimobiledevice
+          libimobiledevice-utils
+          usbutils
+          MT3000_FILE_EOF
+          cat > 'build-kit/README.md' <<'MT3000_FILE_EOF'
+          # GL.iNet GL-MT3000 · ImmortalWrt 云构建包
+          
+          当前交付的是构建配置与定制文件，尚未执行 GitHub Actions，没有已验证可刷写的固件。需在你的 GitHub 仓库运行工作流生成镜像。
+          
+          ## 功能
+          
+          - 官方 ImmortalWrt 25.12.2，mediatek/filogic，精确机型 glinet_gl-mt3000。
+          - 中文 LuCI + Argon 响应式主题；网络 → 快捷设置，集中修改双频 SSID、密码、安全模式和 AP 开关。
+          - 信道、发射功率、radio 开关、中继和访客网络继续使用完整无线设置页。
+          - Android USB RNDIS / CDC-NCM / CDC-ECM / CDC-EEM，iPhone ipheth + usbmuxd + libimobiledevice。
+          - 热插拔及开机扫描 USB 网卡，自动为 phone 接口绑定设备并通过 DHCP 取地址，加入 WAN 防火墙区。
+          - WAN metric 10，phone metric 30。有线优先，拔掉 WAN 网线后使用手机。仅配置 IPv4 手机出口。
+          - 保留官方无线驱动、LAN 地址和默认无线状态；首次使用从 LAN 网口登录，设置管理员密码，然后开启无线 radio、设置无线密码并应用。
+          - 不预置通用 Wi-Fi 密码，不在构建日志或仓库保存你的网络密码。
+          
+          ## GitHub Actions 使用
+          
+          1. 在 GitHub 新建仓库，把本目录的**内容**推送到仓库根目录。必须包含隐藏目录 .github（网页上传容易漏掉；推荐用 Git）。
+          2. 如用 Git，进入本目录后执行以下命令，把占位地址替换为自己的仓库：
+             git init
+             git add .
+             git commit -m "Add MT3000 firmware build"
+             git branch -M main
+             git remote add origin https://github.com/YOUR_NAME/YOUR_REPO.git
+             git push -u origin main
+          3. 打开 Actions → MT3000 ImmortalWrt → Run workflow。
+          4. 成功后下载 Artifacts 中的 mt3000-immortalwrt-25.12.2。
+          5. 确认工作流所有步骤成功。失败时也可能有仅包含日志或未完成产物的 Artifact，不能据此认为固件可用。
+          6. 解压后查看 *.manifest、build.log 与 SHA256SUMS。刷机前核对镜像的 SHA256。
+          
+          方案使用官方 ImageBuilder，把官方预编译内核和软件包装配成定制固件，并非完整源码编译。驱动与内核来自同一发行版。
+          ImageBuilder 约 1 GB，已固定官方 SHA256。软件仓库后续可能更新，因此不承诺逐字节重复构建。
+          工作流只上传 Artifact，不自动发布 Release，不访问或刷写路由器。
+          
+          ## 首次配置
+          
+          通过 LAN 网口连接路由器，按官方默认地址进入 LuCI（通常为 192.168.1.1）。
+          设置 root 管理密码。HTTPS 初次访问可能出现本地证书提示。
+          进入 网络 → 无线，启用 2.4GHz/5GHz radio，按所在地区配置国家代码。
+          再进入 网络 → 快捷设置，为两个 AP 设置 SSID、安全方式和密码，保存并应用。
+          如需统一双频名称，可填写相同 SSID、密码和安全方式；这不代表强制无缝漫游。
+          
+          Android：用支持数据传输的线连接路由器 USB-A，手机开启“USB 网络共享”。
+          iPhone：打开“个人热点 / 允许其他人加入”，解锁并点击“信任”，必要时重新插拔。
+          USB-C 口用于路由器供电，手机连接 USB-A 主机口。
+          进入 网络 → 接口 查看 phone 是否拿到 IPv4 地址。拔掉 WAN 网线后确认局域网设备能通过手机上网。
+          
+          默认同时连接多个 USB 网卡时，保留当前已绑定网卡；CDC 驱动也可匹配普通 USB 网卡。
+          有线仍有链路但上游断网时不会按健康检测自动切换；要使用手机请拔掉 WAN 网线。
+          停用 phone 时取消其“开机自动运行”并停止接口，避免重新插入时恢复连接。
+          
+          ## 刷写前需要确认
+          
+          当前路由器固件、分区布局与引导方式尚未提供，因此这里不提供从原厂固件强刷的命令。
+          生成的 *glinet_gl-mt3000-squashfs-sysupgrade.bin 用于相应布局下的系统升级。
+          从原厂 GL.iNet 固件迁移前，先阅读机型安装说明；不要强制跳过镜像兼容检查。
+          跨原厂与 ImmortalWrt 升级时不要直接沿用原配置。备份当前配置，并了解恢复方法。
+          不要刷写其他机型镜像、不要改写 bootloader 或无线校准分区。
+          
+          机型说明：https://openwrt.org/toh/gl.inet/gl-mt3000
+          官方发行目录：https://downloads.immortalwrt.org/releases/25.12.2/targets/mediatek/filogic/
+          USB 共享说明：https://openwrt.org/docs/guide-user/network/wan/smartphone.usb.tethering
+          
+          ## 验证状态
+          
+          本地已通过 JavaScript / JSON 语法检查。当前沙箱无法启动 Git Bash，因此 Shell 语法检查及 6 项隔离 USB 检测逻辑测试由云端工作流执行，尚未运行。
+          云端镜像构建、LuCI 页面运行、手机兼容性、无线与刷写均待实际运行验证。
+          云端脚本会校验 ImageBuilder 摘要、机型存在性、sysupgrade 镜像及关键软件包清单。
+          MT3000_FILE_EOF
+          mkdir -p 'build-kit/files/etc/hotplug.d/net'
+          cat > 'build-kit/files/etc/hotplug.d/net/90-phone' <<'MT3000_FILE_EOF'
+          #!/bin/sh
+          [ "$ACTION" = add ] || exit 0
+          /usr/sbin/phone-detect "$INTERFACE"
+          MT3000_FILE_EOF
+          mkdir -p 'build-kit/files/etc/init.d'
+          cat > 'build-kit/files/etc/init.d/phone-detect' <<'MT3000_FILE_EOF'
+          #!/bin/sh /etc/rc.common
+          START=99
+          start() {
+              /usr/sbin/phone-detect
+          }
+          MT3000_FILE_EOF
+          mkdir -p 'build-kit/files/etc/uci-defaults'
+          cat > 'build-kit/files/etc/uci-defaults/99-mt3000' <<'MT3000_FILE_EOF'
+          #!/bin/sh
+          . /lib/functions.sh
+          uci set luci.main.lang='zh_cn'
+          uci set luci.main.mediaurlbase='/luci-static/argon'
+          uci commit luci
+          uci -q get network.phone >/dev/null || {
+              uci set network.phone='interface'
+              uci set network.phone.proto='dhcp'
+              uci set network.phone.metric='30'
+              uci set network.phone.peerdns='1'
+              uci set network.phone.ipv6='0'
+          }
+          uci -q get network.wan >/dev/null && uci set network.wan.metric='10'
+          uci commit network
+          add_phone_to_wan() {
+              local name nets
+              config_get name "$1" name
+              [ "$name" = wan ] || return 0
+              config_get nets "$1" network
+              case " $nets " in
+                  *' phone '*) ;;
+                  *) uci add_list "firewall.$1.network=phone" ;;
+              esac
+          }
+          config_load firewall
+          config_foreach add_phone_to_wan zone
+          uci commit firewall
+          [ ! -x /etc/init.d/usbmuxd ] || /etc/init.d/usbmuxd enable
+          /etc/init.d/phone-detect enable
+          exit 0
+          MT3000_FILE_EOF
+          mkdir -p 'build-kit/files/usr/sbin'
+          cat > 'build-kit/files/usr/sbin/phone-detect' <<'MT3000_FILE_EOF'
+          #!/bin/sh
+          # Only capture USB network drivers, never built-in Ethernet.
+          bind_phone() {
+              local iface="$1" path driver current
+              case "$iface" in ''|*[!a-zA-Z0-9_.:-]*) return 0 ;; esac
+              path=$(readlink -f "/sys/class/net/$iface/device") || return 0
+              case "$path" in */usb*/*) ;; *) return 0 ;; esac
+              driver=$(basename "$(readlink -f "/sys/class/net/$iface/device/driver")")
+              case "$driver" in rndis_host|cdc_ether|cdc_ncm|cdc_eem|ipheth) ;; *) return 0 ;; esac
+              [ "$(uci -q get network.phone.proto)" = dhcp ] || return 0
+              [ "$(uci -q get network.phone.auto)" != 0 ] || return 0
+              current=$(uci -q get network.phone.device)
+              [ -z "$current" ] || [ "$current" = "$iface" ] || [ ! -e "/sys/class/net/$current" ] || return 0
+              if [ "$current" != "$iface" ]; then
+                  uci set "network.phone.device=$iface" || return 1
+                  uci commit network || return 1
+                  ubus call network reload >/dev/null 2>&1 || return 1
+                  logger -t phone-detect "USB uplink: $iface ($driver)"
+              fi
+              ifup phone
+          }
+          mkdir /var/lock/phone-detect.lock 2>/dev/null || exit 0
+          trap 'rmdir /var/lock/phone-detect.lock' EXIT
+          if [ -n "$1" ]; then
+              bind_phone "$1"
+          else
+              for entry in /sys/class/net/*; do bind_phone "${entry##*/}"; done
+          fi
+          MT3000_FILE_EOF
+          mkdir -p 'build-kit/files/usr/share/luci/menu.d'
+          cat > 'build-kit/files/usr/share/luci/menu.d/luci-app-mt3000.json' <<'MT3000_FILE_EOF'
+          {
+            "admin/network/mt3000": {
+              "title": "快捷设置",
+              "order": 1,
+              "action": {
+                "type": "view",
+                "path": "mt3000/quick"
+              },
+              "depends": {
+                "acl": [
+                  "luci-app-mt3000"
+                ]
+              }
+            }
+          }
+          MT3000_FILE_EOF
+          mkdir -p 'build-kit/files/usr/share/rpcd/acl.d'
+          cat > 'build-kit/files/usr/share/rpcd/acl.d/luci-app-mt3000.json' <<'MT3000_FILE_EOF'
+          {
+            "luci-app-mt3000": {
+              "description": "Edit Wi-Fi using LuCI UCI apply",
+              "read": {
+                "uci": [
+                  "wireless"
+                ]
+              },
+              "write": {
+                "uci": [
+                  "wireless"
+                ]
+              }
+            }
+          }
+          MT3000_FILE_EOF
+          mkdir -p 'build-kit/files/www/luci-static/resources/view/mt3000'
+          cat > 'build-kit/files/www/luci-static/resources/view/mt3000/quick.js' <<'MT3000_FILE_EOF'
+          'use strict';
+          'require view';
+          'require form';
+          'require uci';
+          
+          return view.extend({
+              load: function() { return uci.load('wireless'); },
+              render: function() {
+                  var m = new form.Map('wireless', 'Wi-Fi 快捷设置',
+                      '分别设置双频名称、密码与开关。点“保存并应用”后，无线连接可能暂时断开。');
+                  var s = m.section(form.TypedSection, 'wifi-iface');
+                  s.anonymous = true;
+                  s.addremove = false;
+                  s.filter = function(id) { return uci.get('wireless', id, 'mode') === 'ap'; };
+                  s.sectiontitle = function(id) {
+                      var radio = uci.get('wireless', id, 'device');
+                      return (uci.get('wireless', radio, 'band') || radio || '') + ' · ' + (uci.get('wireless', id, 'ssid') || id);
+                  };
+                  var o = s.option(form.Flag, 'disabled', '启用此 Wi-Fi');
+                  o.enabled = '0'; o.disabled = '1'; o.default = '0'; o.rmempty = false;
+                  o = s.option(form.Value, 'ssid', 'Wi-Fi 名称');
+                  o.datatype = 'maxlength(32)'; o.rmempty = false;
+                  o = s.option(form.ListValue, 'encryption', '安全方式');
+                  o.value('sae-mixed', 'WPA2 / WPA3 兼容模式');
+                  o.value('sae', 'WPA3');
+                  o.value('psk2', 'WPA2');
+                  o.rmempty = false;
+                  o = s.option(form.Value, 'key', 'Wi-Fi 密码');
+                  o.password = true; o.datatype = 'wpakey'; o.rmempty = false;
+                  return m.render().then(function(node) {
+                      node.prepend(E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:12px;margin:0 0 24px' }, [
+                          E('a', { 'class': 'cbi-button cbi-button-action', 'href': L.url('admin/network/wireless') }, '信道 / 功率 / 中继'),
+                          E('a', { 'class': 'cbi-button', 'href': L.url('admin/network/network') }, '手机 USB 网络状态'),
+                          E('a', { 'class': 'cbi-button', 'href': L.url('admin/status/syslog') }, '连接日志')
+                      ]));
+                      node.appendChild(E('div', { 'class': 'cbi-section', 'style': 'margin-top:24px' }, [
+                          E('h3', {}, '手机 USB 共享上网'),
+                          E('p', {}, '安卓：数据线连接路由器 USB-A 口，在手机开启 USB 网络共享。iPhone：开启个人热点、解锁手机并选择信任此设备。'),
+                          E('p', {}, '识别后的接口名称为 phone。有线 WAN 优先，拔掉 WAN 网线即可使用手机网络。'),
+                          E('p', {}, '停用手机上网可在接口页面取消 phone 的自动启动并停止接口。开启 radio、调整信道或配置中继请进入高级无线设置。')
+                      ]));
+                      return node;
+                  });
+              }
+          });
+          MT3000_FILE_EOF
+          mkdir -p 'build-kit/tests'
+          cat > 'build-kit/tests/verify.cjs' <<'MT3000_FILE_EOF'
+          const fs = require('fs'), path = require('path'), cp = require('child_process'), assert = require('assert');
+          const root = path.resolve(__dirname, '..');
+          const bash = 'bash';
+          for (const p of ['build.sh','files/etc/uci-defaults/99-mt3000','files/etc/hotplug.d/net/90-phone','files/etc/init.d/phone-detect','files/usr/sbin/phone-detect']) {
+           const r=cp.spawnSync(bash,['-n',path.join(root,p)],{encoding:'utf8'}); assert.equal(r.status,0,r.stderr);
+          }
+          for(const p of ['files/usr/share/luci/menu.d/luci-app-mt3000.json','files/usr/share/rpcd/acl.d/luci-app-mt3000.json']) JSON.parse(fs.readFileSync(path.join(root,p),'utf8'));
+          const js=cp.spawnSync(process.execPath,['--check',path.join(root,'files/www/luci-static/resources/view/mt3000/quick.js')],{encoding:'utf8'}); assert.equal(js.status,0,js.stderr);
+          const fn=fs.readFileSync(path.join(root,'files/usr/sbin/phone-detect'),'utf8').split('\nmkdir /var/lock/')[0];
+          for (const t of [
+           {driver:'rndis_host',usb:true,auto:'1',want:true},
+           {driver:'cdc_ncm',usb:true,auto:'1',want:true},
+           {driver:'ipheth',usb:true,auto:'1',want:true},
+           {driver:'mtk_soc_eth',usb:false,auto:'1',want:false},
+           {driver:'rndis_host',usb:true,auto:'0',want:false},
+           {driver:'unknown',usb:true,auto:'1',want:false}
+          ]) {
+           const mock=fn+'\n'+`
+          readlink() {
+           case "$2" in
+           */driver) echo "/drivers/$DRIVER" ;;
+           *) echo "$DEVICE" ;;
+           esac
+          }
+          uci() {
+           case "$*" in
+           "-q get network.phone.proto") echo dhcp ;;
+           "-q get network.phone.auto") echo "$AUTO" ;;
+           "-q get network.phone.device") echo "" ;;
+           *) echo "UCI $*" ;;
+           esac
+          }
+          ubus() { :; }
+          logger() { :; }
+          ifup() { echo "IFUP $*"; }
+          bind_phone usb0
+          `;
+           const r=cp.spawnSync(bash,['-c',mock],{encoding:'utf8',env:{...process.env,DRIVER:t.driver,DEVICE:t.usb?'/devices/platform/usb1/1-1/1-1:1.0':'/devices/platform/ethernet',AUTO:t.auto}});
+           assert.equal(r.status,0,r.stderr); assert.equal(r.stdout.includes('IFUP phone'),t.want,JSON.stringify(t)+r.stdout);
+          }
+          console.log('PASS: 5 shell files, JavaScript, 2 JSON files; 6 USB detection cases.');
+          MT3000_FILE_EOF
+      - name: Verify build scripts and USB detection
+        working-directory: build-kit
+        run: node tests/verify.cjs
+      - name: Build image
+        working-directory: build-kit
+        run: bash build.sh
+      - name: Upload firmware and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt3000-immortalwrt-25.12.2
+          path: build-kit/firmware/
+          if-no-files-found: warn
+          retention-days: 14
